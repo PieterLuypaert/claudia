@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""Claudia, Claude's cousin, says something in the terminal.
+
+  claudia                 her favourite line
+  claudia some text       she says your text
+  echo text | claudia     she says what you pipe in
+
+She is pixel art drawn with half blocks: true colour when the terminal sets
+COLORTERM=truecolor, 256 colours otherwise, and grey shades with NO_COLOR or
+when the output is not a terminal. In a terminal she types her line while
+talking, blinks, winks and sends a few hearts up, and then she farts: a green
+cloud puffs up beside her, stinks for a while and drifts off. Otherwise she is
+printed once, standing still.
+"""
+import collections
+import os
+import shutil
+import stat
+import sys
+import textwrap
+import time
+
+LINE = "Liefde is zoals een scheet: als je het forceert, zit er kak tussen."
+
+# One character per pixel, two pixel rows per terminal line; "." is transparent.
+SPRITE = [
+    ".........dddddddd.........",
+    ".......ddHHHHHHHHdd.......",
+    ".....dHHHHhhhhHHHHHFfF....",
+    "....dHHHhhhhHHHHHHHFYFF...",
+    "...dHHHhhHHHHHHHHHHfYFf...",
+    "..dHHHhhHHHHHHHHHHHHFfFd..",
+    "..dHHhhHHHHHHHHHHHHHHHHd..",
+    "..dHHHHHHHHHHHHHHHHHHHHd..",
+    ".dHHHHSSSHHHHHHHHHHHHHHHd.",
+    ".dHHHHSSSSSHHHSSSHHHHHHHd.",
+    ".dHHHHSSSSSSHSSSSSHSHHHHd.",
+    ".dHHHHsSdddSSSSdddSsHHHHd.",
+    ".dHhHHSKSSSSSSSSSSKSHHHHd.",
+    ".dHhHHSSKKKKSSKKKKSSHHHHd.",
+    ".dHhHHSSEWPESSEWPESSHHHHd.",
+    ".dHhHHSSEPPESSEPPESSHHHHd.",
+    ".dHhHHSSSeeSSSSeeSSSHHHHd.",
+    ".dHhHHSBBSSSSSSSSBBSHHHHd.",
+    ".dHHHGSSSSSSSsSSSSSSGHHHd.",
+    ".dHHHGSSSSSLSSLSSSSSGHHHd.",
+    ".dHHHHHSSSSSLLSSSSSHHHHHd.",
+    ".dHHHHHHSSSSSSSSSSHHHHHHd.",
+    ".dHHHHHHHHsSSSSsHHHHHHHHd.",
+    ".dHHHHHHHHHssssHHHHHHHHHd.",
+    ".dHHHHHHHHHSSSSHHHHHHHHHd.",
+    "dHHHHHSSSSSSSSSSSSSSHHHHHd",
+    "dHHHHHTTTSSSSSSSSTTTHHHHHd",
+    "dHHHHHTTTTSSSSSSTTTTHHHHHd",
+    "dHHHHHTTTTTSSSSTTTTTHHHHHd",
+    "dHHHHHtTTTTTSSTTTTTtHHHHHd",
+    "dHHHHtTTTTTTTTTTTTTTtHHHHd",
+    ".dHHHtTTTTTTTTTTTTTTtHHHd.",
+    "..dHHtTTTTTTTTTTTTTTtHHd..",
+    "...ddtTTTTTTTTTTTTTTtdd...",
+]
+
+PALETTE = {
+    "d": (92, 34, 22),     # hair outline
+    "H": (142, 59, 34),    # auburn hair
+    "h": (192, 96, 58),    # hair shine
+    "S": (247, 210, 180),  # skin
+    "s": (230, 174, 140),  # skin shadow
+    "K": (43, 27, 23),     # lashes
+    "W": (255, 255, 255),  # eye sparkle
+    "E": (59, 125, 216),   # iris
+    "e": (127, 179, 240),  # iris, lower half
+    "P": (28, 42, 74),     # pupil
+    "B": (244, 160, 160),  # blush
+    "L": (217, 69, 95),    # lips
+    "G": (245, 197, 66),   # gold earrings
+    "F": (255, 138, 196),  # flower petals
+    "f": (224, 85, 156),   # flower petal shadow
+    "Y": (255, 211, 78),   # flower heart
+    "T": (124, 92, 214),   # top
+    "t": (91, 63, 176),    # top shadow
+    "M": (122, 31, 51),    # inside of the mouth
+    "R": (232, 64, 102),   # hearts
+    "r": (255, 170, 195),  # heart shine
+    "C": (141, 198, 63),   # cloud
+    "c": (92, 140, 45),    # cloud edge
+    "w": (200, 232, 150),  # cloud shine
+    "V": (176, 214, 128),  # fading cloud
+    "v": (130, 170, 90),   # fading cloud edge
+    "g": (160, 205, 90),   # stink lines
+}
+
+# Face changes as (row, column, pixels) patches on SPRITE.
+CLOSED_LEFT_EYE = [(12, 7, "S"), (13, 8, "SSSS"), (14, 8, "SSSS"), (15, 7, "KKKKK"), (16, 8, "SSSS")]
+CLOSED_RIGHT_EYE = [(12, 18, "S"), (13, 14, "SSSS"), (14, 14, "SSSS"), (15, 14, "KKKKK"), (16, 14, "SSSS")]
+SQUEEZED_EYES = [  # >< with flushed cheeks
+    (12, 7, "S"), (13, 8, "KSSS"), (14, 8, "SKKS"), (15, 8, "KSSS"), (16, 8, "SSSS"),
+    (12, 18, "S"), (13, 14, "SSSK"), (14, 14, "SKKS"), (15, 14, "SSSK"), (16, 14, "SSSS"),
+    (17, 6, "BBB"), (17, 17, "BBB"), (18, 6, "BB"), (18, 18, "BB"),
+]
+EYES = {
+    "open": [],
+    "closed": CLOSED_LEFT_EYE + CLOSED_RIGHT_EYE,
+    "wink": CLOSED_RIGHT_EYE,
+    "squeezed": SQUEEZED_EYES,
+}
+MOUTHS = {"closed": [], "open": [(19, 11, "LMML")]}
+
+# Props drawn on the stage around her; "." is transparent here too.
+PROPS = {
+    "heart": [
+        "RR.RR",
+        "RrRRR",
+        "RRRRR",
+        ".RRR.",
+        "..R..",
+    ],
+    "puff_small": [
+        ".ccc.",
+        "cCwCc",
+        "cCCCc",
+        ".ccc.",
+    ],
+    "puff_medium": [
+        "..cc.cc..",
+        ".cCCcCCc.",
+        "cCwCCCCCc",
+        "cCCCCCCCc",
+        "cCCCCCCCc",
+        ".ccccccc.",
+    ],
+    "cloud": [
+        ".....cc...cc....",
+        "...ccCCc.cCCc...",
+        "..cCCCCCcCCCCc..",
+        ".cCwwCCCCCCCCCc.",
+        "cCwCCCCCCCCCCCCc",
+        "cCwCCCCCCCCCCCCc",
+        "cCCCCCCCCCCCCCCc",
+        ".cCCCCCCCCCCCCc.",
+        "..ccCCCccCCCcc..",
+        "....ccc..ccc....",
+    ],
+    "cloud_specks": [
+        "................",
+        ".....v.....v....",
+        "..v.......v.....",
+        "........v.....v.",
+        ".v...v..........",
+        ".........v...v..",
+        "...v.v..........",
+        "..........v.....",
+        ".....v.......v..",
+        "................",
+    ],
+    "stink": [
+        ".g...g...g..",
+        "..g...g...g.",
+        ".g...g...g..",
+        "..g...g...g.",
+        ".g...g...g..",
+        "..g...g...g.",
+    ],
+}
+PROPS["cloud_fading"] = [row.translate(str.maketrans("Ccw", "VvV")) for row in PROPS["cloud"]]
+PROPS["stink_wiggled"] = PROPS["stink"][1:] + PROPS["stink"][:1]
+
+TRANSPARENT = "."
+STAGE_LEFT = 13  # room left of her for the cloud
+STAGE_TOP = 6    # room above her for the hearts
+STAGE_WIDTH = STAGE_LEFT + len(SPRITE[0])
+STAGE_HEIGHT = STAGE_TOP + len(SPRITE)
+MOUTH_LINE = (STAGE_TOP + 19) // 2  # terminal line of her mouth, where the bubble's tail points
+HEARTS = [(0, STAGE_LEFT + 19), (5, STAGE_LEFT + 20), (10, STAGE_LEFT + 18)]  # (frame it rises from, column)
+HEART_START_ROW = STAGE_TOP + 17
+HEART_DELAY = 0.04
+CLOUD_ROW = STAGE_HEIGHT - len(PROPS["cloud"])
+STINK_ROW = CLOUD_ROW - len(PROPS["stink"]) - 1
+FART_SOUND = "PRRRT!"
+FART_SOUND_AT = (10, 1)  # (terminal line, column) on the stage, above the cloud
+FART_DELAY = 0.08
+STINK_FRAMES = 16
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+GREY_SHADES = "░▒▓█"
+INDENT = "  "
+MAX_BUBBLE_WIDTH = 36
+MIN_BUBBLE_WIDTH = 16
+TYPING_DELAY = 0.035
+MAX_TYPING_FRAMES = 60
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+CURSOR_UP = "\033[{}A"
+CLEAR_LINE = "\r\033[2K"
+
+# One frame of the performance: how much of her line is typed out, her face,
+# the props on stage, a sound written beside her, how far she is nudged
+# sideways when she shakes, and how long the frame stays up.
+Step = collections.namedtuple(
+    "Step", "shown eyes mouth props sound nudge seconds",
+    defaults=("open", "closed", (), None, 0, 0),
+)
+
+
+def is_piped():
+    """True when stdin is a pipe or a file; reading a terminal or an open device would hang."""
+    if sys.stdin is None:
+        return False
+    mode = os.fstat(sys.stdin.fileno()).st_mode
+    return stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
+
+
+def pick_text():
+    if len(sys.argv) > 1:
+        return " ".join(sys.argv[1:])
+    if is_piped():
+        piped = sys.stdin.read().strip()
+        if piped:
+            return piped
+    return LINE
+
+
+def color_mode():
+    if "NO_COLOR" in os.environ or not sys.stdout.isatty():
+        return "grey"
+    if os.environ.get("COLORTERM") in ("truecolor", "24bit"):
+        return "truecolor"
+    return "256"
+
+
+def sgr(rgb, layer, mode):
+    """Escape code for rgb as foreground (layer 38) or background (layer 48)."""
+    if mode == "truecolor":
+        return "\033[{};2;{};{};{}m".format(layer, *rgb)
+    r, g, b = (round(channel / 255 * 5) for channel in rgb)
+    return "\033[{};5;{}m".format(layer, 16 + 36 * r + 6 * g + b)
+
+
+def grey_cell(top, bottom):
+    pixels = [PALETTE[p] for p in (top, bottom) if p != TRANSPARENT]
+    if not pixels:
+        return " "
+    luminance = sum(0.2126 * r + 0.7152 * g + 0.0722 * b for r, g, b in pixels)
+    level = luminance / len(pixels) / 255
+    return GREY_SHADES[min(len(GREY_SHADES) - 1, int(level * len(GREY_SHADES)))]
+
+
+def color_cell(top, bottom, mode):
+    if top == TRANSPARENT and bottom == TRANSPARENT:
+        return " "
+    if top == TRANSPARENT:
+        return sgr(PALETTE[bottom], 38, mode) + "▄" + RESET
+    if bottom == TRANSPARENT:
+        return sgr(PALETTE[top], 38, mode) + "▀" + RESET
+    return sgr(PALETTE[top], 38, mode) + sgr(PALETTE[bottom], 48, mode) + "▀" + RESET
+
+
+def face(eyes, mouth):
+    """SPRITE with the given eyes and mouth, as named in EYES and MOUTHS."""
+    rows = list(SPRITE)
+    for y, x, pixels in EYES[eyes] + MOUTHS[mouth]:
+        rows[y] = rows[y][:x] + pixels + rows[y][x + len(pixels):]
+    return rows
+
+
+def paste(rows, sprite, x, y):
+    """Draw sprite onto rows with its top-left corner at (x, y), clipped to the stage."""
+    for dy, sprite_row in enumerate(sprite):
+        if not 0 <= y + dy < len(rows):
+            continue
+        for dx, pixel in enumerate(sprite_row):
+            if pixel != TRANSPARENT and 0 <= x + dx < len(rows[0]):
+                rows[y + dy][x + dx] = pixel
+
+
+def stage(step):
+    """Pixel rows of the stage: Claudia with the step's face and nudge, its props drawn over her."""
+    rows = [[TRANSPARENT] * STAGE_WIDTH for _ in range(STAGE_HEIGHT)]
+    paste(rows, face(step.eyes, step.mouth), STAGE_LEFT + step.nudge, STAGE_TOP)
+    for name, x, y in step.props:
+        paste(rows, PROPS[name], x, y)
+    return ["".join(row) for row in rows]
+
+
+def draw_stage(pixels, mode, sound=None):
+    lines = []
+    for top_row, bottom_row in zip(pixels[0::2], pixels[1::2]):
+        if mode == "grey":
+            lines.append([grey_cell(t, b) for t, b in zip(top_row, bottom_row)])
+        else:
+            lines.append([color_cell(t, b, mode) for t, b in zip(top_row, bottom_row)])
+    if sound:
+        write_sound(lines, sound, mode)
+    return [INDENT + "".join(cells) for cells in lines]
+
+
+def write_sound(lines, sound, mode):
+    """Write the sound over the stage's cells, in bold cloud green, above the cloud."""
+    line, column = FART_SOUND_AT
+    style = "" if mode == "grey" else BOLD + sgr(PALETTE["C"], 38, mode)
+    for i, char in enumerate(sound):
+        lines[line][column + i] = style + char + (RESET if style else "")
+
+
+def wrap(text, width):
+    lines = []
+    for paragraph in text.splitlines() or [""]:
+        lines.extend(textwrap.wrap(paragraph, width) or [""])
+    return lines
+
+
+def reveal(lines, shown):
+    """The lines with only their first `shown` characters typed out."""
+    visible = []
+    for line in lines:
+        visible.append(line[:max(0, shown)])
+        shown -= len(line)
+    return visible
+
+
+def bubble(lines, width, tail_at=None):
+    """Box the lines; with tail_at, a tail sticks out left at that text line."""
+    box = ["  ╭" + "─" * (width + 2) + "╮"]
+    for i, line in enumerate(lines):
+        edge = "──┤ " if i == tail_at else "  │ "
+        box.append(edge + line.ljust(width) + " │")
+    box.append("  ╰" + "─" * (width + 2) + "╯")
+    return box
+
+
+def side_by_side(art, lines, width):
+    tail_at = len(lines) // 2
+    start = max(0, MOUTH_LINE - 1 - tail_at)
+    box = bubble(lines, width, tail_at)
+    blank = INDENT + " " * STAGE_WIDTH
+    height = max(len(art), start + len(box))
+    art = art + [blank] * (height - len(art))
+    box = [""] * start + box + [""] * (height - start - len(box))
+    return [a + b for a, b in zip(art, box)]
+
+
+def stacked(art, lines, width):
+    tail = [INDENT + " " * (STAGE_LEFT + 10) + "╲", INDENT + " " * (STAGE_LEFT + 11) + "╲"]
+    return bubble(lines, width) + tail + art
+
+
+class Scene:
+    """Claudia and her bubble, drawable at any step of the performance."""
+
+    def __init__(self, text, mode, columns):
+        self.mode = mode
+        room = columns - len(INDENT) - STAGE_WIDTH - 8
+        self.is_side_by_side = room >= MIN_BUBBLE_WIDTH
+        wrap_width = min(MAX_BUBBLE_WIDTH, room) if self.is_side_by_side else max(MIN_BUBBLE_WIDTH, columns - 8)
+        self.lines = wrap(text, wrap_width)
+        self.width = max(len(line) for line in self.lines)
+        self.length = sum(len(line) for line in self.lines)
+
+    def frame(self, step):
+        art = draw_stage(stage(step), self.mode, step.sound)
+        lines = reveal(self.lines, step.shown)
+        if self.is_side_by_side:
+            output = side_by_side(art, lines, self.width)
+        else:
+            output = stacked(art, lines, self.width)
+        return [line.rstrip() for line in output]
+
+
+def timeline(length):
+    """The steps of the whole performance."""
+    yield from talking(length)
+    yield from blinking(length)
+    yield from hearts(length)
+    yield from fart(length)
+
+
+def talking(length):
+    """She types her line out while her mouth moves."""
+    step = max(1, -(-length // MAX_TYPING_FRAMES))
+    for i, shown in enumerate(list(range(0, length, step)) + [length]):
+        mouth = "open" if (i // 3) % 2 == 0 else "closed"
+        yield Step(shown, mouth=mouth, seconds=TYPING_DELAY)
+
+
+def blinking(length):
+    for eyes, seconds in (("open", 0.5), ("closed", 0.12), ("open", 0.4), ("wink", 0.4)):
+        yield Step(length, eyes=eyes, seconds=seconds)
+
+
+def hearts(length):
+    """Hearts rise one after another from beside her face, swaying, and float off the top."""
+    height = len(PROPS["heart"])
+    last_start = max(start for start, _ in HEARTS)
+    for frame in range(last_start + HEART_START_ROW + height + 1):
+        props = []
+        for start, x in HEARTS:
+            risen = frame - start
+            if risen >= 0 and HEART_START_ROW - risen > -height:
+                props.append(("heart", x + risen // 3 % 2, HEART_START_ROW - risen))
+        yield Step(length, props=props, seconds=HEART_DELAY)
+
+
+def fart(length):
+    """Prrrt: a cloud bursts out beside her, stinks for a while, then drifts off and fades."""
+    yield from fart_burst(length)
+    yield from fart_stink(length)
+    yield from fart_drift(length)
+    yield Step(length)
+
+
+def fart_burst(length):
+    """She shakes while the cloud puffs up from the bottom of the stage."""
+    cloud_width = len(PROPS["cloud"][0])
+    for i, name in enumerate(["puff_small", "puff_small", "puff_medium", "puff_medium", "cloud", "cloud"]):
+        sprite = PROPS[name]
+        x = (cloud_width - len(sprite[0])) // 2
+        props = [(name, x, STAGE_HEIGHT - len(sprite))]
+        yield Step(length, "squeezed", "open", props, FART_SOUND, nudge=-(i % 2), seconds=0.07)
+
+
+def fart_stink(length):
+    """The cloud hangs there wobbling under wiggling stink lines while she squeezes her eyes shut."""
+    for i in range(STINK_FRAMES):
+        stink = "stink" if i % 2 == 0 else "stink_wiggled"
+        props = [("cloud", 0, CLOUD_ROW - (i // 2) % 2), (stink, 2, STINK_ROW)]
+        sound = FART_SOUND if i < STINK_FRAMES // 2 else None
+        mouth = "open" if i < STINK_FRAMES // 2 else "closed"
+        yield Step(length, "squeezed", mouth, props, sound, seconds=FART_DELAY)
+
+
+def fart_drift(length):
+    """The cloud drifts up and away, fading until only a few specks are left."""
+    looks = ["cloud"] * 4 + ["cloud_fading"] * 4 + ["cloud_specks"] * 3
+    for i, name in enumerate(looks, start=1):
+        props = [(name, -(i // 2), CLOUD_ROW - 2 * i)]
+        yield Step(length, "closed" if i < 4 else "open", props=props, seconds=FART_DELAY)
+
+
+def play(scene):
+    height = 0
+    sys.stdout.write(HIDE_CURSOR)
+    try:
+        for step in timeline(scene.length):
+            lines = scene.frame(step)
+            if height:
+                sys.stdout.write(CURSOR_UP.format(height))
+            sys.stdout.write("".join(CLEAR_LINE + line + "\n" for line in lines))
+            sys.stdout.flush()
+            height = len(lines)
+            time.sleep(step.seconds)
+    finally:
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+
+def main():
+    mode = color_mode()
+    size = shutil.get_terminal_size()
+    scene = Scene(pick_text(), mode, size.columns)
+    still = scene.frame(Step(scene.length))
+    fits = size.columns > len(INDENT) + STAGE_WIDTH and size.lines > len(still)
+    if mode != "grey" and fits:
+        play(scene)
+    else:
+        print("\n".join(still))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
